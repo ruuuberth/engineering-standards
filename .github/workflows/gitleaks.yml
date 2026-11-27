@@ -1,0 +1,233 @@
+name: Gitleaks
+
+# Escaneo de secretos reutilizable. Dos modos:
+#   - PR:  escanea solo el rango de commits del PR (--log-opts), con fetch-depth 0.
+#   - push en ramas principales: escanea el historial completo del repo.
+#
+# Uso (en el consumidor):
+#   jobs:
+#     gitleaks:
+#       uses: ruuuberth/engineering-standards/.github/workflows/gitleaks.yml@v1.0.0
+#
+# Seguridad:
+#   - El binario de gitleaks se descarga con SHA256 verificado y versión fija.
+#   - `--redact` en TODAS las ejecuciones: el valor del secreto nunca aparece
+#     en logs ni en el informe JSON (verificado localmente con 8.30.1).
+#   - El informe se sube como artefacto; no se publica el secreto en el PR.
+#   - Excepciones SOLO mediante el allowlist central (configs/gitleaks/),
+#     o el allowlist del consumidor, nunca con `continue-on-error`.
+#   - permisos mínimos: contents: read (no se necesitan secrets).
+
+on:
+  workflow_call:
+    inputs:
+      gitleaks-version:
+        description: "Versión de gitleaks CLI (sin la v)."
+        type: string
+        default: "8.30.1"
+      gitleaks-sha256:
+        description: "SHA256 del tarball linux_x64 de esa versión."
+        type: string
+        default: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+      config-source:
+        description: "central | consumer | both. De dónde tomar la configuración."
+        type: string
+        default: both
+      central-config:
+        description: "Ruta (dentro del repo central) del fichero de configuración."
+        type: string
+        default: configs/gitleaks/gitleaks.toml
+      consumer-config:
+        description: "Ruta (dentro del consumidor) a su .gitleaks.toml; se usa si existe."
+        type: string
+        default: .gitleaks.toml
+      scan-mode:
+        description: "pr | full | auto"
+        type: string
+        default: auto
+      enable-comments:
+        description: "Publicar un resumen en el PR (sin valores de secretos)."
+        type: boolean
+        default: true
+      fail-on-leak:
+        description: "Fallar el job si hay hallazgos. No desactivar en producción."
+        type: boolean
+        default: true
+      timeout-minutes:
+        type: number
+        default: 15
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: gitleaks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: Gitleaks secret scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    steps:
+      - name: Checkout del repo consumidor (historial completo)
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Traer configuración central
+        if: inputs.config-source == 'central' || inputs.config-source == 'both'
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .central-standards
+          persist-credentials: false
+
+      - name: Instalar gitleaks (checksum verificado)
+        id: install
+        shell: bash
+        env:
+          VERSION: ${{ inputs.gitleaks-version }}
+          EXPECTED: ${{ inputs.gitleaks-sha256 }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          asset="gitleaks_${VERSION}_linux_x64.tar.gz"
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}"
+          curl -sSfL -o "$asset" "$base/$asset"
+          curl -sSfL -o checksums.txt "$base/gitleaks_${VERSION}_checksums.txt"
+          WANT="$(grep -F "$asset" checksums.txt | cut -d' ' -f1)"
+          ACTUAL="$(sha256sum "$asset" | cut -d' ' -f1)"
+          if [[ -z "$WANT" || "$WANT" != "$ACTUAL" || "$ACTUAL" != "$EXPECTED" ]]; then
+            echo "::error::Checksum de gitleaks inválido (esperado $EXPECTED, obtenido $ACTUAL, publicado $WANT)"
+            exit 1
+          fi
+          echo "gitleaks v$VERSION verificado: $ACTUAL"
+          tar xzf "$asset" gitleaks
+          install -m 0755 gitleaks /usr/local/bin/gitleaks
+          gitleaks version
+
+      - name: Resolver configuración y rango
+        id: setup
+        shell: bash
+        env:
+          CONFIG_SOURCE: ${{ inputs.config-source }}
+          CENTRAL_CONFIG: ${{ inputs.central-config }}
+          CONSUMER_CONFIG: ${{ inputs.consumer-config }}
+          SCAN_MODE: ${{ inputs.scan-mode }}
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          config=""
+          if [[ -f "$CONSUMER_CONFIG" ]] && [[ "$CONFIG_SOURCE" == "consumer" || "$CONFIG_SOURCE" == "both" ]]; then
+            config="$CONSUMER_CONFIG"
+            echo "Usando configuración del consumidor: $config"
+          elif [[ -f ".central-standards/$CENTRAL_CONFIG" ]]; then
+            config=".central-standards/$CENTRAL_CONFIG"
+            echo "Usando configuración central: $config"
+          fi
+          [[ -n "$config" ]] && echo "config=$config" >> "$GITHUB_OUTPUT"
+
+          mode="$SCAN_MODE"
+          if [[ "$mode" == "auto" ]]; then
+            if [[ "$EVENT_NAME" == "pull_request" || "$EVENT_NAME" == "pull_request_target" ]]; then
+              mode=pr
+            else
+              mode=full
+            fi
+          fi
+          logopts=""
+          if [[ "$mode" == "pr" ]]; then
+            if [[ -z "$BASE_SHA" ]]; then
+              echo "::error::scan-mode=pr requiere el contexto de un pull_request"
+              exit 1
+            fi
+            logopts="$BASE_SHA..$HEAD_SHA"
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "logopts=$logopts" >> "$GITHUB_OUTPUT"
+          echo "Modo de escaneo: $mode (rango: ${logopts:-historial completo})"
+
+      - name: Ejecutar escaneo (redactado)
+        id: scan
+        shell: bash
+        env:
+          CONFIG: ${{ steps.setup.outputs.config }}
+          LOGOPTS: ${{ steps.setup.outputs.logopts }}
+          REPORT: ${{ runner.temp }}/gitleaks-report.json
+        run: |
+          set -euo pipefail
+          args=(git . --redact --no-banner --no-color --exit-code 1 \
+                --report-format json --report-path "$REPORT" --log-level warn)
+          if [[ -n "${CONFIG:-}" ]]; then args+=(--config "$CONFIG"); fi
+          if [[ -n "${LOGOPTS:-}" ]]; then args+=(--log-opts="$LOGOPTS"); fi
+          set +e
+          gitleaks "${args[@]}" 2>&1 | tee "$RUNNER_TEMP/gitleaks.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          count="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' "$REPORT" 2>/dev/null || echo 0)"
+          echo "leaks=$count" >> "$GITHUB_OUTPUT"
+          echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+          echo "Hallazgos: $count (exit=$rc). Los valores están redactados."
+          if [[ "$count" != "0" ]]; then
+            REPORT_FILE="$REPORT" python3 - <<'PY'
+          import json, os
+          data = json.load(open(os.environ["REPORT_FILE"]))
+          for x in data:
+              print("::warning::Posible secreto: regla=%s fichero=%s linea=%s" % (
+                  x.get("RuleID"), x.get("File"), x.get("StartLine")))
+          PY
+          fi
+          exit 0  # el fallo real lo decide el paso siguiente, con fail-on-leak
+
+      - name: Subir informe redactado
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: gitleaks-report
+          path: ${{ runner.temp }}/gitleaks-report.json
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Resumen en el PR
+        if: inputs.enable-comments && github.event_name == 'pull_request'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          LEAKS: ${{ steps.scan.outputs.leaks }}
+          MODE: ${{ steps.setup.outputs.mode }}
+        with:
+          script: |
+            const n = Number(process.env.LEAKS || 0);
+            const marker = '<!-- gitleaks-report -->';
+            const state = n === 0 ? 'sin hallazgos' : `**${n} hallazgo(s)**`;
+            const body = [
+              marker, '### Gitleaks — escaneo de secretos', '',
+              `Modo: \`${process.env.MODE}\` · Resultado: ${state}.`, '',
+              n > 0
+                ? 'Revisa el artefacto `gitleaks-report`. Los valores están redactados; **rota cualquier credencial real** antes de continuar.'
+                : 'No se detectaron secretos en el rango analizado.',
+            ].join('\n');
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments,
+              { owner, repo, issue_number, per_page: 100 });
+            const previous = comments.find((c) => c.body?.includes(marker));
+            if (previous) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: previous.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+      - name: Fallar si hay secretos
+        if: inputs.fail-on-leak && steps.scan.outputs.leaks != '0'
+        shell: bash
+        env:
+          LEAKS: ${{ steps.scan.outputs.leaks }}
+        run: |
+          echo "::error::Gitleaks encontró $LEAKS posible(s) secreto(s). Rota las credenciales afectadas y corrige el código; si es un falso positivo documentado, añade una excepción justificada al allowlist."
+          exit 1

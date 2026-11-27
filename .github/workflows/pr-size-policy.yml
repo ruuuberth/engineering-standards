@@ -1,0 +1,287 @@
+name: PR Size Policy
+
+# Política de tamaño de PR (Balanced) reutilizable mediante `workflow_call`.
+#
+# Uso en el repo CONSUMIDOR (el trigger vive ALLÍ, no aquí):
+#
+#   on:
+#     pull_request_target:
+#       types: [opened, synchronize, reopened, labeled, unlabeled]
+#   jobs:
+#     pr-size:
+#       uses: ruuuberth/engineering-standards/.github/workflows/pr-size-policy.yml@v1.0.0
+#
+# `github.repository` dentro de un workflow reutilizable es el repo CONSUMIDOR:
+# el recálculo y el status se aplican al PR de ese repo, no a este.
+#
+# Límites (Balanced):
+#     1..100   -> PASS
+#     101..150 -> PASS con WARNING
+#     >=151    -> FAIL, merge bloqueado por el status check obligatorio
+# Líneas modificadas = adiciones + eliminaciones, excluyendo:
+#     **/*.lock, **/generated/**, **/dist/**, **/build/**, **/*.min.js, **/*.min.css
+# No se excluyen tests, documentación ni configuraciones normales.
+#
+# Excepción: etiqueta `size-exempt` + justificación obligatoria en el cuerpo
+# del PR, aplicada únicamente por un mantenedor autorizado. Si se retira la
+# etiqueta, el evento `unlabeled` vuelve a ejecutar el cálculo y reaplica el
+# límite.
+#
+# Seguridad: se usa `pull_request_target` porque hace falta `statuses: write`
+# para publicar el commit status (con `pull_request` el token es de solo lectura
+# en PRs de forks). Es seguro porque NO se ejecuta código del PR: solo se
+# consulta la API de GitHub y se ejecuta el script de ESTE repositorio,
+# checked out en un ref fijo. El cuerpo del PR se pasa al script por fichero y
+# nunca se interpola en un shell (execFileSync con array de argumentos).
+
+on:
+  workflow_call:
+    inputs:
+      max-pass-lines:
+        description: "Límite superior (inclusive) que pasa sin aviso."
+        type: number
+        default: 100
+      max-warn-lines:
+        description: "Límite superior (inclusive) que pasa con aviso. Por encima: FAIL."
+        type: number
+        default: 150
+      exempt-label:
+        description: "Etiqueta que exime del límite."
+        type: string
+        default: size-exempt
+      excluded-paths:
+        description: "Patrones glob separados por comas, excluidos del recuento."
+        type: string
+        default: "**/*.lock,**/generated/**,**/dist/**,**/build/**,**/*.min.js,**/*.min.css"
+      require-authorized-actor:
+        description: "Exigir que quien aplicó la etiqueta sea mantenedor."
+        type: boolean
+        default: true
+      min-permission:
+        description: "Permiso mínimo para eximir: read|triage|write|maintain|admin."
+        type: string
+        default: write
+      unattributable-exemption:
+        description: "Si no se puede atribuir la etiqueta: deny (rechaza) o warn (concede con aviso)."
+        type: string
+        default: deny
+      min-justification-chars:
+        description: "Caracteres no vacíos mínimos de la justificación."
+        type: number
+        default: 15
+      status-context:
+        description: "Contexto del commit status; debe coincidir con el required status check."
+        type: string
+        default: "PR Size Policy"
+      comment-on-pr:
+        description: "Publicar/actualizar un comentario con el desglose."
+        type: boolean
+        default: true
+      central-repo:
+        description: "Repo central del que se toma el script de política."
+        type: string
+        default: ruuuberth/engineering-standards
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+concurrency:
+  group: pr-size-policy-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: PR Size Policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      # Un workflow reutilizable NO tiene los ficheros del repo central en el
+      # workspace: `actions/checkout` sin `repository` trae el repo CONSUMIDOR.
+      #
+      # `github.workflow_ref` apunta al workflow LLAMANTE, así que no sirve.
+      # Los que sí resuelven al workflow llamado son `job.workflow_repository`
+      # y `job.workflow_sha`. Traemos el central en ese SHA exacto: así el
+      # script de política está siempre alineado con la versión del workflow
+      # que el consumidor fijó (p. ej. @v1.0.0), sin referencias mutables.
+      # Es un SHA de origen confiable (GitHub), no entrada de usuario: no hay
+      # riesgo de inyección de ref.
+      - name: Checkout del repo central (script de política)
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .central-standards
+          persist-credentials: false
+
+      - name: Calcular tamaño y publicar status
+        id: policy
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          MAX_PASS: ${{ inputs.max-pass-lines }}
+          MAX_WARN: ${{ inputs.max-warn-lines }}
+          EXEMPT_LABEL: ${{ inputs.exempt-label }}
+          EXCLUDED_PATHS: ${{ inputs.excluded-paths }}
+          REQUIRE_AUTHORIZED_ACTOR: ${{ inputs.require-authorized-actor }}
+          MIN_PERMISSION: ${{ inputs.min-permission }}
+          UNATTRIBUTABLE: ${{ inputs.unattributable-exemption }}
+          MIN_JUSTIFICATION_CHARS: ${{ inputs.min-justification-chars }}
+          STATUS_CONTEXT: ${{ inputs.status-context }}
+          COMMENT_ON_PR: ${{ inputs.comment-on-pr }}
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            const { execFileSync } = require('child_process');
+
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const prNumber = context.payload.pull_request?.number;
+            if (!prNumber) {
+              core.setFailed('Este workflow requiere un evento de pull_request_target.');
+              return;
+            }
+
+            // 1. Ficheros del PR con adiciones/eliminaciones por fichero.
+            //    github.paginate cubre PRs de más de 30 ficheros; GitHub sirve
+            //    hasta 3000, y el script trata ese techo como diff truncado.
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: prNumber, per_page: 100,
+            });
+
+            // 2. Cuerpo del PR (justificación) y etiquetas actuales.
+            const { data: pr } = await github.rest.pulls.get({
+              owner, repo, pull_number: prNumber,
+            });
+
+            // 3. Timeline: quién aplicó la etiqueta de exención.
+            const timeline = await github.paginate(
+              github.rest.issues.listEventsForTimeline, {
+                owner, repo, issue_number: prNumber, per_page: 100,
+              });
+            const exemptLabel = process.env.EXEMPT_LABEL;
+            const labelEvents = timeline
+              .filter((e) => e.event === 'labeled' && e.label?.name === exemptLabel)
+              .sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
+
+            let labelActor = null;
+            let labelActorPermission = null;
+            const hasLabel = (pr.labels || []).some((l) => l.name === exemptLabel);
+
+            if (hasLabel && labelEvents.length > 0) {
+              labelActor = labelEvents[labelEvents.length - 1].actor?.login ?? null;
+              if (labelActor) {
+                try {
+                  const { data: perm } = await github.rest.repos.getCollaboratorPermissionLevel({
+                    owner, repo, username: labelActor,
+                  });
+                  labelActorPermission = perm.permission ?? 'unknown';
+                } catch (err) {
+                  labelActorPermission = 'unknown';
+                }
+              }
+            }
+
+            // 4. Ejecutar el motor de política (Python puro, sin red).
+            const scriptPath = path.join(
+              process.env.GITHUB_WORKSPACE, '.central-standards', 'scripts', 'pr_size_policy.py');
+            if (!fs.existsSync(scriptPath)) {
+              core.setFailed('No se encuentra scripts/pr_size_policy.py en el repo central.');
+              return;
+            }
+
+            const tmp = process.env.RUNNER_TEMP;
+            const filesFile = path.join(tmp, 'pr-files.jsonl');
+            const bodyFile = path.join(tmp, 'pr-body.md');
+            const verdictFile = path.join(tmp, 'pr-size-verdict.json');
+
+            fs.writeFileSync(filesFile, files.map((f) => JSON.stringify({
+              filename: f.filename,
+              additions: f.additions,
+              deletions: f.deletions,
+            })).join('\n'), 'utf8');
+            // El cuerpo del PR se escribe a fichero; NUNCA se interpola en un
+            // shell ni se pasa como argumento (evita inyección de comandos).
+            fs.writeFileSync(bodyFile, pr.body ?? '', 'utf8');
+
+            const cliArgs = [
+              scriptPath,
+              '--files', filesFile,
+              '--body', bodyFile,
+              '--labels', (pr.labels || []).map((l) => l.name).join(','),
+              '--exempt-label', exemptLabel,
+              '--max-pass', String(process.env.MAX_PASS),
+              '--max-warn', String(process.env.MAX_WARN),
+              '--min-permission', process.env.MIN_PERMISSION,
+              '--unattributable', process.env.UNATTRIBUTABLE,
+              '--min-justification-chars', String(process.env.MIN_JUSTIFICATION_CHARS),
+              '--json-out', verdictFile,
+            ];
+            if (labelActor) cliArgs.push('--label-actor', labelActor);
+            if (labelActorPermission) cliArgs.push('--actor-permission', labelActorPermission);
+            if (process.env.REQUIRE_AUTHORIZED_ACTOR !== 'true') {
+              cliArgs.push('--no-require-authorized-actor');
+            }
+            for (const pattern of (process.env.EXCLUDED_PATHS || '')
+                .split(',').map((s) => s.trim()).filter(Boolean)) {
+              cliArgs.push('--exclude', pattern);
+            }
+
+            let raw;
+            try {
+              // Array de argumentos: sin shell, sin interpretación de metacaracteres.
+              raw = execFileSync('python3', cliArgs, { encoding: 'utf8' });
+            } catch (err) {
+              core.setFailed(`Fallo al ejecutar la política:\n${err.stdout ?? ''}\n${err.stderr ?? ''}`);
+              return;
+            }
+            const verdict = JSON.parse(raw);
+
+            // 5. Commit status: ESTE es el check que branch protection exige.
+            const state = verdict.status_state === 'failure' ? 'failure' : 'success';
+            const shortDesc = verdict.verdict === 'warn'
+              ? `WARNING: ${verdict.total_changed} lineas (max ${process.env.MAX_WARN}); merge permitido.`
+              : verdict.verdict === 'fail'
+                ? `FAIL: ${verdict.total_changed} lineas superan ${process.env.MAX_WARN}.`
+                : `PASS: ${verdict.total_changed} lineas modificadas.`;
+
+            await github.rest.repos.createCommitStatus({
+              owner, repo,
+              sha: pr.head.sha,
+              state,
+              context: process.env.STATUS_CONTEXT,
+              description: shortDesc.slice(0, 140),
+              target_url: `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`,
+            });
+
+            // 6. Comentario sticky con el desglose (no crea uno por push).
+            if (process.env.COMMENT_ON_PR === 'true') {
+              const marker = '<!-- pr-size-policy-report -->';
+              const body = [
+                marker, '### Política de tamaño de PR', '', verdict.summary, '',
+                `Status check: \`${process.env.STATUS_CONTEXT}\``,
+              ].join('\n');
+              const existing = await github.paginate(
+                github.rest.issues.listComments, { owner, repo, issue_number: prNumber, per_page: 100 });
+              const previous = existing.find((c) => c.body?.includes(marker));
+              if (previous) {
+                await github.rest.issues.updateComment({ owner, repo, comment_id: previous.id, body });
+              } else {
+                await github.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
+              }
+            }
+
+            core.setOutput('verdict', verdict.verdict);
+            core.setOutput('total-changed', String(verdict.total_changed));
+            core.setOutput('summary', verdict.summary);
+
+            if (verdict.verdict === 'fail') {
+              core.setFailed(
+                `PR demasiado grande: ${verdict.total_changed} lineas ` +
+                `(maximo ${process.env.MAX_WARN}). ${verdict.exemption?.reason ?? ''}`.trim());
+            } else if (verdict.verdict === 'warn') {
+              core.warning(
+                `PR grande: ${verdict.total_changed} lineas (hasta ${process.env.MAX_WARN}).`);
+            }

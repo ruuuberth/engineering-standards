@@ -1,0 +1,50 @@
+# Configuración centralizada de gitleaks para todos los repositorios consumidores.
+#
+# Esta configuración vive en el repo central engineering-standards y se referencia
+# desde el workflow gitleaks.yml mediante `--config .central-standards/configs/gitleaks/gitleaks.toml`.
+#
+# Extiende las reglas por defecto de gitleaks (AWS keys, GitHub tokens, secrets
+# genéricos) y añade patrones específicos de PSS conocidas.
+#
+# La política de esta organización es: useDefault = true, y los allowlists se
+# completan con las reglas específicas del proyecto (quando el consumidor lo
+# configura en su .gitleaks.toml).
+#
+# Flujo: en el workflow, se pasa `--config .central-standards/configs/gitleaks/gitleaks.toml`
+# a menos que el consumidor establezca config-source=consumer y tenga su propio
+# fichero .gitleaks.toml.
+
+title = "engineering-standards gitleaks configuration"
+
+# Mantener las reglas por defecto de gitleaks (AWS keys, tokens genéricos, SSH,
+# certificados, etc.).
+[extend]
+useDefault = true
+
+# Allowlists conocidas, no son secretos verdaderos.
+[[rules]]
+id = "pss-checksum-key"
+description = "Checksum key del juego (valor 5343) — no es un secreto real."
+regex = "(?i)checksum[_-]?key\\s*[:=]\\s*['\"]5343['\"]"
+
+[[rules]]
+id = "pss-savy-checksum"
+description = "Savy checksum — no es un secreto real."
+regex = "(?i)savy[_-]?checksum\\s*[:=]\\s*['\"]Savvy!s0d@['\"]"
+
+# Tokens y claves que aparecen en código PSS; deben eximirse del escaneo o
+# forzarse a la allowlist central.
+[[rules]]
+id = "pss-refresh-token"
+description = "Refresh token embebido en código (no debe commitearse)."
+regex = "(?i)refresh[_-]?token\\s*[:=]\\s*['\"][A-Za-z0-9._-]{8,}['\"]"
+
+[[rules]]
+id = "pss-access-token"
+description = "Access token embebido en código (no debe commitearse)."
+regex = "(?i)access[_-]?token\\s*[:=]\\s*['\"][A-Za-z0-9._-]{8,}['\"]"
+
+[[rules]]
+id = "pss-api-key"
+description = "API key o secret key embebido en código (no debe commitearse)."
+regex = "(?i)(?:api[_-]?key|secret[_-]?key|api[_-]?secret|private[_-]?key)\\s*[:=]\\s*['\"][A-Za-z0-9._-]{8,}['\"]"

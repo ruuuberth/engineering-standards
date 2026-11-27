@@ -1,0 +1,249 @@
+name: OpenCode Review
+
+# Integración reutilizable de OpenCode Review (OCR).
+#
+# Basada en la implementación REAL de `ruuuberth/pss-mcp` (.github/workflows/
+# ocr-review.yml), inspeccionada para este repo. Cambios respecto a ella:
+#   - Se elimina el trigger local: ahora el CONSUMIDOR decide los eventos.
+#   - `alibaba/open-code-review@main` (referencia mutable) se fija al commit
+#     de la release v1.13.6: 891df1b63f380845d882a289a67a6e36c331120c.
+#   - Secrets/vars se declaran explícitamente en `workflow_call`.
+#   - Se añade el gate de autoría para comentarios y la resolución de refs.
+#
+# Uso (en el consumidor):
+#
+#   on:
+#     pull_request_target:
+#       types: [opened, synchronize, reopened]
+#     issue_comment:
+#       types: [created]
+#   jobs:
+#     review:
+#       uses: ruuuberth/engineering-standards/.github/workflows/opencode-review.yml@v1.0.0
+#       permissions:
+#         contents: read
+#         pull-requests: write
+#       with:
+#         llm-model: ${{ vars.OCR_LLM_MODEL }}
+#         llm-use-anthropic: "false"
+#       secrets:
+#         OCR_LLM_URL: URL_LLM
+#         OCR_LLM_AUTH_TOKEN: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
+#
+# Seguridad: el consumidor DEBE usar `pull_request_target` (no `pull_request`)
+# para que los secrets estén disponibles en PRs de forks. Es seguro porque la
+# acción oficial de OCR hace checkout de la rama BASE y solo obtiene los blobs
+# del head del PR como objetos git: NO materializa ni ejecuta código del PR.
+# Este workflow tampoco hace checkout del head. Nunca añadir un step que ejecute
+# código del PR bajo `pull_request_target`.
+
+on:
+  workflow_call:
+    inputs:
+      llm-model:
+        description: "Nombre del modelo (antes: vars.OCR_LLM_MODEL)."
+        type: string
+        required: true
+      llm-use-anthropic:
+        description: "Protocolo: 'true' = Anthropic, 'false' = OpenAI-compatible. Nunca dejar vacío: vacío selecciona Anthropic."
+        type: string
+        default: "false"
+      llm-protocol:
+        description: "Protocolo explícito: anthropic | openai | openai-responses. Vacío = derivar de llm-use-anthropic."
+        type: string
+        default: ""
+      language:
+        description: "Idioma de los comentarios de revisión."
+        type: string
+        default: "Spanish"
+      llm-timeout:
+        description: "Timeout de petición al LLM en segundos."
+        type: string
+        default: "300"
+      review-task-timeout:
+        description: "Timeout por fichero, en minutos (1-120)."
+        type: string
+        default: "15"
+      review-concurrency:
+        description: "Concurrencia de OCR. Reducir a 1-2 con proveedores free/rate-limited."
+        type: string
+        default: "2"
+      effort:
+        description: "Esfuerzo de revisión: low | medium | high (vacío = default del CLI)."
+        type: string
+        default: "low"
+      max-tokens-budget:
+        description: "Tope total de tokens (vacío/0 = ilimitado)."
+        type: string
+        default: ""
+      background:
+        description: "Contexto de negocio pasado a `ocr review --background`."
+        type: string
+        default: ""
+      rule-file:
+        description: "Ruta a un rule.json del CONSUMIDOR, pasado como `--rule`."
+        type: string
+        default: ""
+      ocr-version:
+        description: "Versión del paquete npm @alibaba-group/open-code-review."
+        type: string
+        default: "1.13.6"
+      sticky-summary:
+        description: "Actualizar un único comentario resumen en lugar de crear uno por run."
+        type: string
+        default: "true"
+      incremental:
+        description: "Solo comentarios nuevos (no repite los ya publicados)."
+        type: string
+        default: "true"
+      route-severity-below:
+        description: "Enviar hallazgos de severidad <= umbral al resumen en vez de inline."
+        type: string
+        default: "low"
+      upload-artifacts:
+        description: "Subir el JSON crudo y stderr como artefactos."
+        type: string
+        default: "true"
+      comment-trigger:
+        description: "Prefijo para re-lanzar la revisión por comentario."
+        type: string
+        default: "/open-code-review"
+      allow-comment-trigger:
+        description: "Permitir relanzamiento por issue_comment desde OWNER/MEMBER/COLLABORATOR."
+        type: boolean
+        default: true
+      timeout-minutes:
+        type: number
+        default: 30
+    secrets:
+      OCR_LLM_URL:
+        description: "Endpoint del LLM (antes: secret OCR_LLM_URL)."
+        required: true
+      OCR_LLM_AUTH_TOKEN:
+        description: "Token de autenticación del LLM (la acción lo mapea a OCR_LLM_TOKEN)."
+        required: true
+    outputs:
+      comments-total:
+        description: "Total de comentarios generados por OCR."
+        value: ${{ jobs.review.outputs.comments-total }}
+      comments-inline:
+        description: "Comentarios inline publicados."
+        value: ${{ jobs.review.outputs.comments-inline }}
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# Grupo condicional: los comentarios que NO disparan revisión caen en un grupo
+# único por run y no cancelan una revisión en curso (lección de pss-mcp).
+concurrency:
+  group: >-
+    ${{
+      (
+        github.event_name == 'pull_request_target'
+        || (
+          github.event_name == 'issue_comment'
+          && github.event.issue.pull_request
+          && github.event.comment.user.type != 'Bot'
+          && (
+            github.event.comment.author_association == 'MEMBER'
+            || github.event.comment.author_association == 'OWNER'
+            || github.event.comment.author_association == 'COLLABORATOR'
+          )
+          && startsWith(github.event.comment.body, '/open-code-review')
+        )
+      )
+      && format('ocr-{0}', github.event.pull_request.number || github.event.issue.number)
+      || format('noop-{0}', github.run_id)
+    }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: OpenCode Review
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    if: >-
+      github.event_name == 'pull_request_target'
+      || (
+        inputs.allow-comment-trigger
+        && github.event_name == 'issue_comment'
+        && github.event.issue.pull_request
+      )
+    outputs:
+      comments-total: ${{ steps.ocr.outputs.comments_total }}
+      comments-inline: ${{ steps.ocr.outputs.comments_inline }}
+    steps:
+      - name: Resolver contexto del PR
+        id: pr-context
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          TRIGGER: ${{ inputs.comment-trigger }}
+          ALLOW_TRIGGER: ${{ inputs.allow-comment-trigger }}
+        with:
+          script: |
+            const isPrEvent = context.eventName === 'pull_request_target';
+            const trigger = process.env.TRIGGER;
+            let run = isPrEvent;
+
+            if (context.eventName === 'issue_comment') {
+              const c = context.payload.comment || {};
+              const assoc = c.author_association;
+              const trusted = ['MEMBER', 'OWNER', 'COLLABORATOR'].includes(assoc);
+              const isHuman = c.user?.type !== 'Bot';
+              const matches = typeof c.body === 'string' && c.body.trim().startsWith(trigger);
+              run = process.env.ALLOW_TRIGGER === 'true' && isHuman && trusted && matches;
+              if (!run) {
+                core.info('Comentario ignorado (no es un disparador autorizado).');
+              }
+            }
+            core.setOutput('run', String(run));
+            if (!run) return;
+
+            let baseRef, headSha, prNumber;
+            if (isPrEvent) {
+              baseRef = context.payload.pull_request.base.ref;
+              headSha = context.payload.pull_request.head.sha;
+              prNumber = context.payload.pull_request.number;
+            } else {
+              // issue_comment no trae payload de PR: hay que resolverlo.
+              prNumber = context.issue.number;
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: prNumber,
+              });
+              baseRef = pr.base.ref;
+              headSha = pr.head.sha;
+            }
+            core.setOutput('base_ref', baseRef);
+            core.setOutput('head_sha', headSha);
+            core.setOutput('pr_number', String(prNumber));
+            core.info(`PR #${prNumber}: base=${baseRef} head=${headSha}`);
+
+      - name: Ejecutar OpenCodeReview
+        id: ocr
+        if: steps.pr-context.outputs.run == 'true'
+        uses: alibaba/open-code-review@891df1b63f380845d882a289a67a6e36c331120c # v1.13.6
+        with:
+          llm_url: URL_LLM
+          llm_auth_token: ${{ secrets.OCR_LLM_AUTH_TOKEN }}
+          llm_model: ${{ inputs.llm-model }}
+          llm_use_anthropic: ${{ inputs.llm-use-anthropic }}
+          llm_protocol: ${{ inputs.llm-protocol }}
+          language: ${{ inputs.language }}
+          llm_timeout: ${{ inputs.llm-timeout }}
+          review_task_timeout: ${{ inputs.review-task-timeout }}
+          review_concurrency: ${{ inputs.review-concurrency }}
+          effort: ${{ inputs.effort }}
+          max_tokens_budget: ${{ inputs.max-tokens-budget }}
+          background: ${{ inputs.background }}
+          rule: ${{ inputs.rule-file }}
+          ocr_version: ${{ inputs.ocr-version }}
+          sticky_summary: ${{ inputs.sticky-summary }}
+          incremental: ${{ inputs.incremental }}
+          route_severity_below: ${{ inputs.route-severity-below }}
+          upload_artifacts: ${{ inputs.upload-artifacts }}
+          base_ref: ${{ steps.pr-context.outputs.base_ref }}
+          head_sha: ${{ steps.pr-context.outputs.head_sha }}
+          pr_number: ${{ steps.pr-context.outputs.pr_number }}

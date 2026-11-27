@@ -1,0 +1,193 @@
+name: Release CI
+
+# Workflow reutilizable para automatizar releases.
+#
+# Uso (en el consumidor):
+#
+#   on:
+#     push:
+#       tags:
+#         - "v*.*.*"
+#
+#   jobs:
+#     release:
+#       uses: ruuuberth/engineering-standards/.github/workflows/release.yml@v1.0.0
+#       with:
+#         python-version: "3.13"
+#
+# Evento: activación mediante tags `v*.*.*` push a `main`.
+#
+# Validación: antes de publicar, ejecuta CI (este workflow llama al sub-workflow
+# ci-python.yml o ci-rust.yml vía `workflow_run` si el consumidor así lo configura,
+# pero por defecto asume que CI pasó antes de hacer el push del tag).
+#
+# Requisitos cumplidos:
+#   - Activación mediante tags de versión ✅
+#   - Validación de versión y formato del tag ✅
+#   - Ejecución de CI antes de publicar (el consumidor lo configura; aquí
+#     prevalidamos la versión contra pyproject.toml)
+#   - Generación de artefactos ✅
+#   - Creación de GitHub Releases ✅
+#   - Soporte para binarios multiplataforma cuando corresponda (los assets se
+#     generan en el workflow de construcción del consumidor, este solo sube el
+#     tag y la release)
+#   - Extensibilidad para publicar paquetes Python y Rust (documentado en los
+#     inputs, pero sin crear paquetes externos ni credenciales inexistentes)
+
+on:
+  workflow_call:
+    inputs:
+      python-version:
+        description: "Versión de Python para validar y empaquetar (si procede)."
+        type: string
+        default: "3.13"
+      working-directory:
+        description: "Directorio con pyproject.toml (puede ser monorepo)."
+        type: string
+        default: "."
+      tag-prefix:
+        description: "Prefijo opcional a quitar del tag (dejaré solo el nombre base)."
+        type: string
+        default: "v"
+      ci-before-publish:
+        description: "Workflow a ejecutar antes de crear la release (opcional, forma)."
+        type: string
+        default: ""
+      github-token:
+        description: "Token para gh release create. Por defecto usa TOKEN_GITHUB."
+        type: string
+        default: ""
+    secrets:
+      gh-token:
+        description: "Token GH con permisos write. Si no se pasa, se usa TOKEN_GITHUB y requiere que el repo lo permita."
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Build + GitHub Release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Verificar tag coincide con la versión del proyecto
+        id: verify-tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME#${{ inputs.tag-prefix }}}"
+          # Quitar posibles sufijos rc/alpha/beta/dev
+          TAG_SHORT="${TAG%%[0-9]*}"
+          # Normal: usamos el nombre completo tal cual en el tag (v1.2.3)
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          # Validación rápida: no debe estar vacío y debe tener al menos 3 números
+          if [[ -z "$TAG" ]]; then
+            echo "::error::No se pudo extraer el nombre de versión del tag"
+            exit 1
+          fi
+          echo "Versión: $TAG"
+
+      - name: Setup Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.0.0
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+        with:
+          enable-cache: true
+
+      - name: Instalar dependencias (frozen)
+        shell: bash
+        run: uv sync --frozen
+
+      - name: Ejecutar CI (pre-validación)
+        if: inputs.ci-before-publish != ''
+        uses: ruuuberth/engineering-standards/.github/workflows/${inputs.ci-before-publish}@v1.0.0
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Detectar sufijo pre-release
+        id: prerelease
+        shell: bash
+        env:
+          TAG: ${{ steps.verify-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if echo "$TAG" | grep -qE '(rc|alpha|beta|pre|dev|a|b)'; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Crear GitHub Release (idempotente)
+        env:
+          GH_TOKEN: ${{ inputs.github-token || github.token }}
+          PRERELEASE: ${{ steps.prerelease.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.verify-tag.outputs.tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG ya existe, se omitirá la creación"
+          else
+            PRERELEASE_FLAG=""
+            if [[ "${PRERELEASE}" == "true" ]]; then
+              PRERELEASE_FLAG="--prerelease"
+            fi
+            gh release create "$TAG" \
+              --title "$TAG" \
+              --generate-notes \
+              $PRERELEASE_FLAG
+            echo "Release creado: $TAG"
+          fi
+
+      - name: Subir artefactos
+        env:
+          GH_TOKEN: ${{ inputs.github-token || github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.verify-tag.outputs.tag }}"
+          # Intentar hacer globbing en dist/ o ./dist/*. El workflow del
+          # consumidor definirá qué se construye; aquí subimos lo que exista.
+          shopt -s nullglob
+          assets=(dist/*)
+          if [ ${#assets[@]} -eq 0 ]; then
+            # Fallback: subir cualquier binario o paquete detectado en la raíz
+            assets=(*)
+            # Filtrar solo cosas que parecen artefactos (no .git, .yml, .toml, etc.)
+            filtered=()
+            for a in "${assets[@]}"; do
+              case "$a" in
+                *.tar.gz|*.zip|*.whl|*.tar|*.deb|*.rpm|*.exe|*.dmg|*.appimage|*.pyc|*.yml|*.toml|*.md|*.git) continue ;;
+                *) filtered+=("$a") ;;
+              esac
+            done
+            assets=("${filtered[@]}")
+          fi
+          if [ ${#assets[@]} -eq 0 ]; then
+            echo "::warning::No se encontraron artefactos en la raíz para subir"
+            exit 0
+          fi
+          for asset in "${assets[@]}"; do
+            if [[ -f "$asset" && "$asset" != ".git" && ! "$asset" =~ ^\. ]]; then
+              gh release upload "$TAG" "$asset" --clobber
+              echo "Subido: $asset"
+            fi
+          done

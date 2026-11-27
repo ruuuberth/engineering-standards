@@ -1,0 +1,161 @@
+name: CI Rust
+
+# Workflow reutilizable de CI para proyectos Rust. Independiente de ci-python.yml.
+#
+# Uso (en el consumidor):
+#   jobs:
+#     ci-rust:
+#       uses: ruuuberth/engineering-standards/.github/workflows/ci-rust.yml@v1.0.0
+#       with:
+#         working-directory: .
+#
+# No instala Python ni ninguna otra toolchain. Se usa rustup-init verificado por
+# SHA256 y una toolchain fijada por versión (no `@stable` ni `@latest`).
+
+on:
+  workflow_call:
+    inputs:
+      rust-version:
+        description: "Toolchain Rust fijada (p. ej. 1.99.1)."
+        type: string
+        default: "1.99.1"
+      rustup-init-sha256:
+        description: "SHA256 esperado de rustup-init (x86_64-unknown-linux-gnu)."
+        type: string
+        default: "b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55"
+      working-directory:
+        description: "Directorio con Cargo.toml (monorepos)."
+        type: string
+        default: "."
+      cargo-fmt:
+        type: boolean
+        default: true
+      cargo-clippy:
+        type: boolean
+        default: true
+      cargo-test:
+        type: boolean
+        default: true
+      cargo-build:
+        type: boolean
+        default: true
+      clippy-args:
+        description: "Argumentos extra para clippy (p. ej. -- -D warnings)."
+        type: string
+        default: "--all-targets --all-features -- -D warnings"
+      test-args:
+        type: string
+        default: ""
+      install-system-deps:
+        description: "Paquetes apt necesarios (p. ej. libssl-dev)."
+        type: string
+        default: ""
+      rustfmt-config:
+        description: "Ruta a rustfmt.toml del repo central (vacío = usa el del proyecto)."
+        type: string
+        default: ""
+      runs-on:
+        type: string
+        default: ubuntu-24.04
+      timeout-minutes:
+        type: number
+        default: 30
+
+permissions:
+  contents: read
+
+jobs:
+  rust:
+    name: Rust ${{ inputs.rust-version }}
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+
+      - name: Instalar dependencias del sistema
+        if: inputs.install-system-deps != ''
+        shell: bash
+        env:
+          SYSTEM_DEPS: ${{ inputs.install-system-deps }}
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          # shellcheck disable=SC2086
+          sudo apt-get install -y --no-install-recommends $SYSTEM_DEPS
+
+      - name: Instalar Rust (rustup-init verificado + toolchain fijada)
+        shell: bash
+        env:
+          RUST_VERSION: ${{ inputs.rust-version }}
+          EXPECTED_SHA: ${{ inputs.rustup-init-sha256 }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          curl -sSfL -o rustup-init \
+            https://static.rust-lang.org/rustup/dist/x86_64-unknown-linux-gnu/rustup-init
+          ACTUAL="$(sha256sum rustup-init | cut -d' ' -f1)"
+          if [[ "$ACTUAL" != "$EXPECTED_SHA" ]]; then
+            echo "::error::SHA256 de rustup-init no coincide: esperado $EXPECTED_SHA, obtenido $ACTUAL"
+            exit 1
+          fi
+          echo "rustup-init verificado: $ACTUAL"
+          chmod +x rustup-init
+          ./rustup-init -y --no-modify-path --profile minimal \
+            --default-toolchain "$RUST_VERSION" \
+            -c rustfmt -c clippy
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Versiones
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --version && cargo --version && cargo fmt --version && cargo clippy --version
+
+      - name: Comprobar Cargo.toml
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f Cargo.toml ]]; then
+            echo "::error::No se encontró Cargo.toml en el directorio de trabajo"
+            exit 1
+          fi
+
+      - name: Cache de Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: rust-${{ inputs.rust-version }}-${{ hashFiles(format('{0}/Cargo.lock', inputs.working-directory)) }}
+          restore-keys: rust-${{ inputs.rust-version }}-
+
+      - name: cargo fmt --check
+        if: inputs.cargo-fmt
+        shell: bash
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        if: inputs.cargo-clippy
+        shell: bash
+        env:
+          CLIPPY_ARGS: ${{ inputs.clippy-args }}
+        run: cargo clippy $CLIPPY_ARGS
+
+      - name: cargo test
+        if: inputs.cargo-test
+        shell: bash
+        env:
+          TEST_ARGS: ${{ inputs.test-args }}
+        run: cargo test $TEST_ARGS
+
+      - name: cargo build
+        if: inputs.cargo-build
+        shell: bash
+        run: cargo build --verbose
