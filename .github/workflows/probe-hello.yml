@@ -1,0 +1,12 @@
+name: probe hello
+on:
+  workflow_call:
+    inputs:
+      who:
+        type: string
+        default: mundo
+jobs:
+  hola:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "hola ${{ inputs.who }} desde el central"
